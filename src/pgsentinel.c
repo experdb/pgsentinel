@@ -204,6 +204,31 @@ static const char * const pgsa_query_track_idle=
  where act.state in ('active', 'idle in transaction') and act.pid != pg_backend_pid()";
 #endif
 
+/*
+ * The worker connects as the bootstrap superuser, whose search_path is the
+ * default "$user", public.  get_parsedinfo() and pg_active_session_history
+ * live in the extension's schema, so the sampling queries only resolve when
+ * that schema happens to sit on the default path -- which is the case only
+ * when the extension was installed into public or into a schema named after
+ * the bootstrap superuser.  Resolve the extension's own schema from the
+ * catalog and prepend it, so the worker keeps sampling no matter what the
+ * superuser is called or where the extension was installed.
+ *
+ * Run on every sampling period rather than once per worker session.  A session
+ * GUC set with set_config(..., false) is still transactional: if the enclosing
+ * transaction aborts, search_path reverts.  A "did we already do it" flag in C
+ * would not revert with it, and the worker would then sample with the default
+ * path for the rest of its life -- silently, which is the exact failure this
+ * query exists to prevent.  One catalog lookup per period is nothing next to
+ * the sampling query itself, and re-running it also means a relocated
+ * extension is picked up on the next sample instead of at the next restart.
+ */
+static const char * const set_search_path_query=
+"select set_config('search_path', \
+ quote_ident(n.nspname) || ', ' || current_setting('search_path'), false) \
+ from pg_extension e join pg_namespace n on n.oid = e.extnamespace \
+ where e.extname = '" EXTENSION_NAME "'";
+
 static const char * const pg_stat_statements_query=
 #if PG_VERSION_NUM < 130000
 "select userid, dbid, queryid, calls, total_time, rows, shared_blks_hit, \
@@ -998,6 +1023,11 @@ letswait:
 		}
 
 		SPI_connect();
+
+		/* Make the extension's own schema reachable */
+		if (SPI_execute(set_search_path_query, false, 0) != SPI_OK_SELECT)
+			ereport(ERROR,
+					(errmsg("pgsentinel: could not resolve extension schema into search_path")));
 
 		if (ash_track_idle_trans)
 		{
