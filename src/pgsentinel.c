@@ -39,6 +39,9 @@
 #include "access/hash.h"
 #include "commands/extension.h"
 #include "catalog/namespace.h"
+#include <stdio.h>  // add by robin 20250522
+#include <unistd.h> // add by robin 20250522
+#include <string.h> // add by robin 20250522
 #include "catalog/pg_authid.h"
 #include "utils/acl.h"
 
@@ -55,7 +58,7 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(pg_active_session_history);
 PG_FUNCTION_INFO_V1(pg_stat_statements_history);
 
-#define PG_ACTIVE_SESSION_HISTORY_COLS        28
+#define PG_ACTIVE_SESSION_HISTORY_COLS        30  // add by robin 20250522
 #define PG_STAT_STATEMENTS_HISTORY_COLS       24
 #define EXTENSION_NAME "pgsentinel"
 
@@ -63,6 +66,10 @@ PG_FUNCTION_INFO_V1(pg_stat_statements_history);
 void _PG_init(void);
 void _PG_fini(void);
 PGDLLEXPORT void pgsentinel_main(Datum);
+
+/* Function declarations  add by robin 20250522 */
+static int64 get_process_cpu_usage(int pid);
+static unsigned long get_process_memory_usage(int pid);
 
 /* Signal handling */
 static volatile sig_atomic_t got_sigterm = false;
@@ -266,6 +273,8 @@ typedef struct ashEntry
 	TimestampTz xact_start;
 	TimestampTz query_start;
 	TimestampTz state_change;
+	int64 cpu_usage;              /* Cumulative CPU time, microseconds; -1 if unknown */
+	int64 memory_usage;           /* Resident set size, bytes; -1 if unknown */
 } ashEntry;
 
 /* pg_stat_statement_history entry */
@@ -815,6 +824,11 @@ ash_entry_store(TimestampTz ash_time, const int pid,
 {
 	int inserted;
 	inserted=IntEntryArray[0].inserted-1;
+
+	/* Get CPU and memory usage add by robin 20250522 */
+	AshEntryArray[inserted].cpu_usage = get_process_cpu_usage(pid);
+	AshEntryArray[inserted].memory_usage = get_process_memory_usage(pid);
+
 	memcpy(AshEntryArray[inserted].usename,usename,Min(strlen(usename)+1,
 																NAMEDATALEN-1));
 	memcpy(AshEntryArray[inserted].datname,datname,Min(strlen(datname)+1,
@@ -1712,6 +1726,16 @@ pg_active_session_history_internal(FunctionCallInfo fcinfo)
 		else
 			nulls[j++] = true;
 
+		// cpu_usage add by robin 20250522
+		if (AshEntryArray[i].cpu_usage >= 0)
+			values[j++] = Int64GetDatum(AshEntryArray[i].cpu_usage);
+		else
+			nulls[j++] = true;
+		// memory_usage
+		if (AshEntryArray[i].memory_usage >= 0)
+			values[j++] = Int64GetDatum(AshEntryArray[i].memory_usage);
+		else
+			nulls[j++] = true;
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}
 }
@@ -2019,3 +2043,192 @@ ash_shmem_request(void)
 		RequestNamedLWLockTranche("Pgssh Entry Array", 1);
 	}
 }
+/* Get CPU usage for a process add by robin 20250522 */
+static int64 get_process_cpu_usage(int pid)
+{
+	FILE *fp;
+	char path[256];
+	char line[1024];
+	char *p;
+	int i;
+	unsigned long utime = 0, stime = 0, cutime = 0, cstime = 0;
+	int64 total;
+	long clk_tck;
+
+	if (pid <= 0) {
+		ereport(DEBUG1,
+				(errmsg("Invalid pid: %d", pid)));
+		return -1;
+	}
+
+	/* Get clock ticks per second */
+	clk_tck = sysconf(_SC_CLK_TCK);
+	if (clk_tck <= 0) {
+		ereport(DEBUG1,
+				(errmsg("Failed to get _SC_CLK_TCK, using default value 100")));
+		clk_tck = 100;
+	}
+
+	snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+	fp = fopen(path, "r");
+	if (fp == NULL) {
+		ereport(DEBUG1,
+				(errcode_for_file_access(),
+				 errmsg("could not open process stat file \"%s\": %m", path)));
+		return -1;
+	}
+
+	if (fgets(line, sizeof(line), fp) != NULL) {
+		/* Find the last ')', which marks the end of the process name */
+		p = strrchr(line, ')');
+		if (p == NULL) {
+			ereport(DEBUG1,
+					(errmsg("Failed to find ')' in stat line for pid %d", pid)));
+			fclose(fp);
+			return -1;
+		}
+
+		/* Skip to the first field after the process name */
+		p += 2;  /* skip ') ' */
+		if (*p == '\0') {
+			ereport(DEBUG1,
+					(errmsg("Unexpected end of stat line for pid %d", pid)));
+			fclose(fp);
+			return -1;
+		}
+
+		/* Skip 11 fields to reach utime */
+		for (i = 0; i < 11; i++) {
+			p = strchr(p, ' ');
+			if (p == NULL) {
+				ereport(DEBUG1,
+						(errmsg("Failed to find field %d in stat line for pid %d", i+1, pid)));
+				fclose(fp);
+				return -1;
+			}
+			p++;  /* skip space */
+			if (*p == '\0') {
+				ereport(DEBUG1,
+						(errmsg("Unexpected end of stat line at field %d for pid %d", i+1, pid)));
+				fclose(fp);
+				return -1;
+			}
+		}
+
+		/* Read utime, stime, cutime, cstime */
+		utime = atol(p);
+
+		p = strchr(p, ' ');
+		if (p != NULL) {
+			stime = atol(p + 1);
+			p = strchr(p + 1, ' ');
+			if (p != NULL) {
+				cutime = atol(p + 1);
+				p = strchr(p + 1, ' ');
+				if (p != NULL) {
+					cstime = atol(p + 1);
+				}
+			}
+		}
+
+		ereport(DEBUG1,
+				(errmsg("Raw CPU times for pid %d: utime=%lu, stime=%lu, cutime=%lu, cstime=%lu",
+						pid, utime, stime, cutime, cstime)));
+	}
+
+	fclose(fp);
+
+	/* Convert jiffies to microseconds */
+	if (utime == 0 && stime == 0 && cutime == 0 && cstime == 0) {
+		ereport(DEBUG1,
+				(errmsg("All CPU times are zero for pid %d", pid)));
+		return 0;
+	}
+
+	total = (utime + stime + cutime + cstime) * (1000000 / clk_tck);
+
+	ereport(INFO,
+			(errmsg("Final CPU usage for pid %d: total=" INT64_FORMAT " microseconds (CLK_TCK=%ld)",
+					pid, total, clk_tck)));
+
+	return total;
+}
+
+/* Get memory usage for a process */
+static unsigned long get_process_memory_usage(int pid)
+{
+	FILE *fp;
+	char path[256];
+	char line[1024];
+	char *p;
+	unsigned long vm_size = 0, rss = 0;
+	unsigned long rss_bytes = 0;
+
+	if (pid <= 0) {
+		ereport(DEBUG1,
+				(errmsg("Invalid pid: %d", pid)));
+		return 0;
+	}
+
+	snprintf(path, sizeof(path), "/proc/%d/statm", pid);
+	fp = fopen(path, "r");
+	if (fp == NULL) {
+		ereport(DEBUG1,
+				(errcode_for_file_access(),
+				 errmsg("could not open process statm file \"%s\": %m", path)));
+		return 0;
+	}
+
+	if (fgets(line, sizeof(line), fp) != NULL) {
+		/* First field is total program size, second field is RSS */
+		p = line;
+
+		/* Skip leading whitespace */
+		while (*p == ' ' || *p == '\t') p++;
+		if (*p == '\0') {
+			ereport(DEBUG1,
+					(errmsg("Empty statm line for pid %d", pid)));
+			fclose(fp);
+			return 0;
+		}
+
+		vm_size = atol(p);
+
+		/* Find start of second field */
+		p = strchr(p, ' ');
+		if (p == NULL) {
+			ereport(DEBUG1,
+					(errmsg("Failed to find RSS field in statm line for pid %d", pid)));
+			fclose(fp);
+			return 0;
+		}
+
+		/* Skip whitespace */
+		p++;
+		while (*p == ' ' || *p == '\t') p++;
+		if (*p == '\0') {
+			ereport(DEBUG1,
+					(errmsg("Unexpected end of statm line for pid %d", pid)));
+			fclose(fp);
+			return 0;
+		}
+
+		rss = atol(p);
+
+		ereport(DEBUG1,
+				(errmsg("Memory usage for pid %d: vm_size=%lu pages, rss=%lu pages",
+						pid, vm_size, rss)));
+	}
+
+	fclose(fp);
+
+	/* Convert RSS pages to bytes */
+	rss_bytes = rss * sysconf(_SC_PAGESIZE);
+
+	ereport(INFO,
+			(errmsg("Physical memory (RSS) usage for pid %d: %lu bytes (%.2f MB)",
+					pid, rss_bytes, rss_bytes / (1024.0 * 1024.0))));
+
+	return rss_bytes;
+}
+
