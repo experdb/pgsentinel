@@ -41,6 +41,8 @@
 #include "catalog/namespace.h"
 #include <stdio.h>  // add by robin 20250522
 #include <unistd.h> // add by robin 20250522
+#include <fcntl.h>  // add by robin 20250522
+#include <errno.h>  // add by robin 20250522
 #include <string.h> // add by robin 20250522
 #include "catalog/pg_authid.h"
 #include "utils/acl.h"
@@ -2094,10 +2096,53 @@ ash_shmem_request(void)
  */
 #ifdef __linux__
 
+/*
+ * Read a whole /proc file into buf and NUL-terminate it.
+ *
+ * These files are synthesised by the kernel on read and one read() returns the
+ * whole record, but a short read is handled anyway.  Returns false when the
+ * file could not be opened or produced nothing, leaving errno set for %m.
+ *
+ * Deliberately not stdio: fopen() allocates a BUFSIZ buffer on first read, and
+ * this runs twice per sampled session per sampling period.  There is nothing
+ * for that buffer to do -- both files are a single short line.
+ */
+static bool
+read_proc_file(const char *path, char *buf, size_t bufsz)
+{
+	int			fd;
+	size_t		off = 0;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return false;
+
+	for (;;)
+	{
+		ssize_t		n = read(fd, buf + off, bufsz - 1 - off);
+
+		if (n < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			close(fd);
+			return false;
+		}
+		if (n == 0)
+			break;
+		off += (size_t) n;
+		if (off >= bufsz - 1)
+			break;
+	}
+
+	close(fd);
+	buf[off] = '\0';
+	return off > 0;
+}
+
 /* Get CPU usage for a process add by robin 20250522 */
 static int64 get_process_cpu_usage(int pid)
 {
-	FILE *fp;
 	char path[256];
 	char line[1024];
 	char *p;
@@ -2121,21 +2166,19 @@ static int64 get_process_cpu_usage(int pid)
 	}
 
 	snprintf(path, sizeof(path), "/proc/%d/stat", pid);
-	fp = fopen(path, "r");
-	if (fp == NULL) {
+	if (!read_proc_file(path, line, sizeof(line))) {
 		ereport(DEBUG1,
 				(errcode_for_file_access(),
-				 errmsg("could not open process stat file \"%s\": %m", path)));
+				 errmsg("could not read process stat file \"%s\": %m", path)));
 		return -1;
 	}
 
-	if (fgets(line, sizeof(line), fp) != NULL) {
+	{
 		/* Find the last ')', which marks the end of the process name */
 		p = strrchr(line, ')');
 		if (p == NULL) {
 			ereport(DEBUG1,
 					(errmsg("Failed to find ')' in stat line for pid %d", pid)));
-			fclose(fp);
 			return -1;
 		}
 
@@ -2152,7 +2195,6 @@ static int64 get_process_cpu_usage(int pid)
 		if (p[1] == '\0') {
 			ereport(DEBUG1,
 					(errmsg("Unexpected end of stat line for pid %d", pid)));
-			fclose(fp);
 			return -1;
 		}
 
@@ -2160,7 +2202,6 @@ static int64 get_process_cpu_usage(int pid)
 		if (*p == '\0') {
 			ereport(DEBUG1,
 					(errmsg("Unexpected end of stat line for pid %d", pid)));
-			fclose(fp);
 			return -1;
 		}
 
@@ -2170,14 +2211,12 @@ static int64 get_process_cpu_usage(int pid)
 			if (p == NULL) {
 				ereport(DEBUG1,
 						(errmsg("Failed to find field %d in stat line for pid %d", i+1, pid)));
-				fclose(fp);
 				return -1;
 			}
 			p++;  /* skip space */
 			if (*p == '\0') {
 				ereport(DEBUG1,
 						(errmsg("Unexpected end of stat line at field %d for pid %d", i+1, pid)));
-				fclose(fp);
 				return -1;
 			}
 		}
@@ -2198,7 +2237,6 @@ static int64 get_process_cpu_usage(int pid)
 						pid, utime, stime)));
 	}
 
-	fclose(fp);
 
 	/* Convert jiffies to microseconds */
 	if (utime == 0 && stime == 0) {
@@ -2231,7 +2269,6 @@ static int64 get_process_cpu_usage(int pid)
 static void get_process_memory_usage(int pid, int64 *rss_bytes,
 									 int64 *private_bytes)
 {
-	FILE *fp;
 	char path[256];
 	char line[1024];
 	char *p;
@@ -2255,15 +2292,14 @@ static void get_process_memory_usage(int pid, int64 *rss_bytes,
 	}
 
 	snprintf(path, sizeof(path), "/proc/%d/statm", pid);
-	fp = fopen(path, "r");
-	if (fp == NULL) {
+	if (!read_proc_file(path, line, sizeof(line))) {
 		ereport(DEBUG1,
 				(errcode_for_file_access(),
-				 errmsg("could not open process statm file \"%s\": %m", path)));
+				 errmsg("could not read process statm file \"%s\": %m", path)));
 		return;
 	}
 
-	if (fgets(line, sizeof(line), fp) != NULL) {
+	{
 		/* Fields are: size resident shared text lib data dt */
 		p = line;
 
@@ -2272,7 +2308,6 @@ static void get_process_memory_usage(int pid, int64 *rss_bytes,
 		if (*p == '\0') {
 			ereport(DEBUG1,
 					(errmsg("Empty statm line for pid %d", pid)));
-			fclose(fp);
 			return;
 		}
 
@@ -2283,7 +2318,6 @@ static void get_process_memory_usage(int pid, int64 *rss_bytes,
 		if (p == NULL) {
 			ereport(DEBUG1,
 					(errmsg("Failed to find RSS field in statm line for pid %d", pid)));
-			fclose(fp);
 			return;
 		}
 
@@ -2293,7 +2327,6 @@ static void get_process_memory_usage(int pid, int64 *rss_bytes,
 		if (*p == '\0') {
 			ereport(DEBUG1,
 					(errmsg("Unexpected end of statm line for pid %d", pid)));
-			fclose(fp);
 			return;
 		}
 
@@ -2313,7 +2346,6 @@ static void get_process_memory_usage(int pid, int64 *rss_bytes,
 						pid, vm_size, rss, shared)));
 	}
 
-	fclose(fp);
 
 	/*
 	 * Reject page counts that would overflow when scaled to bytes.  A garbled
