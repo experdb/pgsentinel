@@ -2245,7 +2245,18 @@ static int64 get_process_cpu_usage(int pid)
 		return 0;
 	}
 
-	total = (utime + stime) * (1000000 / clk_tck);
+	/*
+	 * Multiply before dividing.  (1000000 / clk_tck) truncates whenever
+	 * clk_tck does not divide 1000000 -- at clk_tck 1024 it yields 976 instead
+	 * of 976.5625, a 0.06% undercount that grows with the counter.  Linux
+	 * fixes USER_HZ at 100 for the /proc interface so this is latent rather
+	 * than active, but the correct order costs nothing.
+	 *
+	 * No overflow risk: utime + stime is in jiffies since backend start, so a
+	 * backend running for a decade at 100Hz reaches about 3e10, and 3e10 * 1e6
+	 * is 3e16 against an int64 ceiling of 9.2e18.
+	 */
+	total = (int64) (utime + stime) * 1000000 / clk_tck;
 
 	ereport(DEBUG1,
 			(errmsg("Final CPU usage for pid %d: total=" INT64_FORMAT " microseconds (CLK_TCK=%ld)",
