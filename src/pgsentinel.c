@@ -2081,6 +2081,19 @@ ash_shmem_request(void)
 		RequestNamedLWLockTranche("Pgssh Entry Array", 1);
 	}
 }
+/*
+ * Per-session CPU and memory sampling reads /proc/<pid>/stat and
+ * /proc/<pid>/statm, which exist only on Linux.  Compile the readers there and
+ * substitute no-cost stubs everywhere else.
+ *
+ * Without this guard a non-Linux build still calls into the readers for every
+ * sampled session on every sampling period, and every one of them fails at
+ * open().  The columns end up NULL either way, so the guard changes no
+ * observable behaviour -- it just stops paying for a result that cannot
+ * differ.
+ */
+#ifdef __linux__
+
 /* Get CPU usage for a process add by robin 20250522 */
 static int64 get_process_cpu_usage(int pid)
 {
@@ -2325,3 +2338,28 @@ static void get_process_memory_usage(int pid, int64 *rss_bytes,
 			(errmsg("Physical memory for pid %d: rss=" INT64_FORMAT " bytes, private=" INT64_FORMAT " bytes",
 					pid, *rss_bytes, *private_bytes)));
 }
+
+#else							/* !__linux__ */
+
+/*
+ * Non-Linux stubs.  /proc is unavailable, so the values cannot be determined
+ * and -1 is returned, which the reader renders as NULL -- exactly as it would
+ * for a read that failed at runtime.
+ */
+static int64
+get_process_cpu_usage(int pid)
+{
+	(void) pid;
+	return -1;
+}
+
+static void
+get_process_memory_usage(int pid, int64 *rss_bytes,
+						 int64 *private_bytes)
+{
+	(void) pid;
+	*rss_bytes = -1;
+	*private_bytes = -1;
+}
+
+#endif							/* __linux__ */
