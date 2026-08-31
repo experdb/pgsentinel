@@ -854,7 +854,16 @@ ash_entry_store(TimestampTz ash_time, const int pid,
 	int inserted;
 	inserted=IntEntryArray[0].inserted-1;
 
-	/* Get CPU and memory usage add by robin 20250522 */
+	/*
+	 * Get CPU and memory usage add by robin 20250522
+	 *
+	 * pid came from the pg_stat_activity snapshot and is looked up in /proc a
+	 * moment later.  If the backend exits in between, the read fails and the
+	 * three columns report NULL.  Attributing the numbers to the wrong session
+	 * would additionally need the kernel to hand that pid to a new process
+	 * inside the same sub-millisecond window, which takes a full wrap of
+	 * pid_max and does not happen outside a stopped debugger.
+	 */
 	AshEntryArray[inserted].cpu_usage = get_process_cpu_usage(pid);
 	get_process_memory_usage(pid, &AshEntryArray[inserted].memory_usage,
 							 &AshEntryArray[inserted].memory_private);
@@ -1761,6 +1770,19 @@ pg_active_session_history_internal(FunctionCallInfo fcinfo)
 		else
 			nulls[j++] = true;
 
+		/*
+		 * The three columns carry -1 when the /proc read produced no value, and
+		 * that is what becomes NULL here.  A successful read of zero stays zero.
+		 *
+		 * The two have to be kept apart because failure is per row, not per
+		 * column: a backend that exits between the pg_stat_activity snapshot and
+		 * the /proc lookup fails with ENOENT for that one pid while every other
+		 * row reads fine.  And zero is a real measurement -- a backend that has
+		 * not yet used a full jiffy of CPU (USER_HZ is 100, so 10ms) has
+		 * genuinely used none.  Collapsing both into NULL would hide the second
+		 * for the first sampling interval of every backend's life.  The DEBUG1
+		 * messages in the readers separate the failure causes when that matters.
+		 */
 		// cpu_usage add by robin 20250522
 		if (AshEntryArray[i].cpu_usage >= 0)
 			values[j++] = Int64GetDatum(AshEntryArray[i].cpu_usage);
@@ -2275,7 +2297,15 @@ static int64 get_process_cpu_usage(int pid)
  * /proc/<pid>/statm carries the resident and shared page counts on the same
  * line, so the private figure costs no extra I/O.
  *
- * Both outputs are set to -1 when the values cannot be determined.
+ * With huge_pages on, hugetlb pages are not counted in statm at all, so
+ * shared_buffers is already absent from resident and private ends up close to
+ * resident.  Neither figure is wrong, but the relationship between the two
+ * columns depends on that setting -- worth knowing before comparing hosts.
+ *
+ * Both outputs are set to -1 when the values cannot be determined; the caller
+ * reports NULL for -1 and passes a successful 0 through unchanged.  See the
+ * emission site in pg_active_session_history_internal() for why the two are
+ * kept apart.
  */
 static void get_process_memory_usage(int pid, int64 *rss_bytes,
 									 int64 *private_bytes)
@@ -2322,6 +2352,7 @@ static void get_process_memory_usage(int pid, int64 *rss_bytes,
 			return;
 		}
 
+		/* Read only so the DEBUG1 line below can report it; not returned. */
 		vm_size = atol(p);
 
 		/* Find start of second field (resident) */
