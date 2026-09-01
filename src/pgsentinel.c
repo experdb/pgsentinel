@@ -39,6 +39,11 @@
 #include "access/hash.h"
 #include "commands/extension.h"
 #include "catalog/namespace.h"
+#include <stdio.h>  // add by robin 20250522
+#include <unistd.h> // add by robin 20250522
+#include <fcntl.h>  // add by robin 20250522
+#include <errno.h>  // add by robin 20250522
+#include <string.h> // add by robin 20250522
 #include "catalog/pg_authid.h"
 #include "utils/acl.h"
 
@@ -55,7 +60,7 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(pg_active_session_history);
 PG_FUNCTION_INFO_V1(pg_stat_statements_history);
 
-#define PG_ACTIVE_SESSION_HISTORY_COLS        28
+#define PG_ACTIVE_SESSION_HISTORY_COLS        31  // add by robin 20250522
 #define PG_STAT_STATEMENTS_HISTORY_COLS       24
 #define EXTENSION_NAME "pgsentinel"
 
@@ -63,6 +68,11 @@ PG_FUNCTION_INFO_V1(pg_stat_statements_history);
 void _PG_init(void);
 void _PG_fini(void);
 PGDLLEXPORT void pgsentinel_main(Datum);
+
+/* Function declarations  add by robin 20250522 */
+static int64 get_process_cpu_usage(int pid);
+static void get_process_memory_usage(int pid, int64 *rss_bytes,
+									 int64 *private_bytes);
 
 /* Signal handling */
 static volatile sig_atomic_t got_sigterm = false;
@@ -196,6 +206,31 @@ static const char * const pgsa_query_track_idle=
  where act.state in ('active', 'idle in transaction') and act.pid != pg_backend_pid()";
 #endif
 
+/*
+ * The worker connects as the bootstrap superuser, whose search_path is the
+ * default "$user", public.  get_parsedinfo() and pg_active_session_history
+ * live in the extension's schema, so the sampling queries only resolve when
+ * that schema happens to sit on the default path -- which is the case only
+ * when the extension was installed into public or into a schema named after
+ * the bootstrap superuser.  Resolve the extension's own schema from the
+ * catalog and prepend it, so the worker keeps sampling no matter what the
+ * superuser is called or where the extension was installed.
+ *
+ * Run on every sampling period rather than once per worker session.  A session
+ * GUC set with set_config(..., false) is still transactional: if the enclosing
+ * transaction aborts, search_path reverts.  A "did we already do it" flag in C
+ * would not revert with it, and the worker would then sample with the default
+ * path for the rest of its life -- silently, which is the exact failure this
+ * query exists to prevent.  One catalog lookup per period is nothing next to
+ * the sampling query itself, and re-running it also means a relocated
+ * extension is picked up on the next sample instead of at the next restart.
+ */
+static const char * const set_search_path_query=
+"select set_config('search_path', \
+ quote_ident(n.nspname) || ', ' || current_setting('search_path'), false) \
+ from pg_extension e join pg_namespace n on n.oid = e.extnamespace \
+ where e.extname = '" EXTENSION_NAME "'";
+
 static const char * const pg_stat_statements_query=
 #if PG_VERSION_NUM < 130000
 "select userid, dbid, queryid, calls, total_time, rows, shared_blks_hit, \
@@ -266,6 +301,9 @@ typedef struct ashEntry
 	TimestampTz xact_start;
 	TimestampTz query_start;
 	TimestampTz state_change;
+	int64 cpu_usage;              /* Cumulative CPU time, microseconds; -1 if unknown */
+	int64 memory_usage;           /* Resident set size, bytes; -1 if unknown */
+	int64 memory_private;         /* Resident private memory, bytes; -1 if unknown */
 } ashEntry;
 
 /* pg_stat_statement_history entry */
@@ -815,6 +853,21 @@ ash_entry_store(TimestampTz ash_time, const int pid,
 {
 	int inserted;
 	inserted=IntEntryArray[0].inserted-1;
+
+	/*
+	 * Get CPU and memory usage add by robin 20250522
+	 *
+	 * pid came from the pg_stat_activity snapshot and is looked up in /proc a
+	 * moment later.  If the backend exits in between, the read fails and the
+	 * three columns report NULL.  Attributing the numbers to the wrong session
+	 * would additionally need the kernel to hand that pid to a new process
+	 * inside the same sub-millisecond window, which takes a full wrap of
+	 * pid_max and does not happen outside a stopped debugger.
+	 */
+	AshEntryArray[inserted].cpu_usage = get_process_cpu_usage(pid);
+	get_process_memory_usage(pid, &AshEntryArray[inserted].memory_usage,
+							 &AshEntryArray[inserted].memory_private);
+
 	memcpy(AshEntryArray[inserted].usename,usename,Min(strlen(usename)+1,
 																NAMEDATALEN-1));
 	memcpy(AshEntryArray[inserted].datname,datname,Min(strlen(datname)+1,
@@ -981,6 +1034,11 @@ letswait:
 		}
 
 		SPI_connect();
+
+		/* Make the extension's own schema reachable */
+		if (SPI_execute(set_search_path_query, false, 0) != SPI_OK_SELECT)
+			ereport(ERROR,
+					(errmsg("pgsentinel: could not resolve extension schema into search_path")));
 
 		if (ash_track_idle_trans)
 		{
@@ -1712,6 +1770,34 @@ pg_active_session_history_internal(FunctionCallInfo fcinfo)
 		else
 			nulls[j++] = true;
 
+		/*
+		 * The three columns carry -1 when the /proc read produced no value, and
+		 * that is what becomes NULL here.  A successful read of zero stays zero.
+		 *
+		 * The two have to be kept apart because failure is per row, not per
+		 * column: a backend that exits between the pg_stat_activity snapshot and
+		 * the /proc lookup fails with ENOENT for that one pid while every other
+		 * row reads fine.  And zero is a real measurement -- a backend that has
+		 * not yet used a full jiffy of CPU (USER_HZ is 100, so 10ms) has
+		 * genuinely used none.  Collapsing both into NULL would hide the second
+		 * for the first sampling interval of every backend's life.  The DEBUG1
+		 * messages in the readers separate the failure causes when that matters.
+		 */
+		// cpu_usage add by robin 20250522
+		if (AshEntryArray[i].cpu_usage >= 0)
+			values[j++] = Int64GetDatum(AshEntryArray[i].cpu_usage);
+		else
+			nulls[j++] = true;
+		// memory_usage
+		if (AshEntryArray[i].memory_usage >= 0)
+			values[j++] = Int64GetDatum(AshEntryArray[i].memory_usage);
+		else
+			nulls[j++] = true;
+		// mem_private_bytes
+		if (AshEntryArray[i].memory_private >= 0)
+			values[j++] = Int64GetDatum(AshEntryArray[i].memory_private);
+		else
+			nulls[j++] = true;
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}
 }
@@ -2019,3 +2105,335 @@ ash_shmem_request(void)
 		RequestNamedLWLockTranche("Pgssh Entry Array", 1);
 	}
 }
+/*
+ * Per-session CPU and memory sampling reads /proc/<pid>/stat and
+ * /proc/<pid>/statm, which exist only on Linux.  Compile the readers there and
+ * substitute no-cost stubs everywhere else.
+ *
+ * Without this guard a non-Linux build still calls into the readers for every
+ * sampled session on every sampling period, and every one of them fails at
+ * open().  The columns end up NULL either way, so the guard changes no
+ * observable behaviour -- it just stops paying for a result that cannot
+ * differ.
+ */
+#ifdef __linux__
+
+/*
+ * Read a whole /proc file into buf and NUL-terminate it.
+ *
+ * These files are synthesised by the kernel on read and one read() returns the
+ * whole record, but a short read is handled anyway.  Returns false when the
+ * file could not be opened or produced nothing, leaving errno set for %m.
+ *
+ * Deliberately not stdio: fopen() allocates a BUFSIZ buffer on first read, and
+ * this runs twice per sampled session per sampling period.  There is nothing
+ * for that buffer to do -- both files are a single short line.
+ */
+static bool
+read_proc_file(const char *path, char *buf, size_t bufsz)
+{
+	int			fd;
+	size_t		off = 0;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return false;
+
+	for (;;)
+	{
+		ssize_t		n = read(fd, buf + off, bufsz - 1 - off);
+
+		if (n < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			close(fd);
+			return false;
+		}
+		if (n == 0)
+			break;
+		off += (size_t) n;
+		if (off >= bufsz - 1)
+			break;
+	}
+
+	close(fd);
+	buf[off] = '\0';
+	return off > 0;
+}
+
+/* Get CPU usage for a process add by robin 20250522 */
+static int64 get_process_cpu_usage(int pid)
+{
+	char path[256];
+	char line[1024];
+	char *p;
+	int i;
+	unsigned long utime = 0, stime = 0;
+	int64 total;
+	long clk_tck;
+
+	if (pid <= 0) {
+		ereport(DEBUG1,
+				(errmsg("Invalid pid: %d", pid)));
+		return -1;
+	}
+
+	/* Get clock ticks per second */
+	clk_tck = sysconf(_SC_CLK_TCK);
+	if (clk_tck <= 0) {
+		ereport(DEBUG1,
+				(errmsg("Failed to get _SC_CLK_TCK, using default value 100")));
+		clk_tck = 100;
+	}
+
+	snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+	if (!read_proc_file(path, line, sizeof(line))) {
+		ereport(DEBUG1,
+				(errcode_for_file_access(),
+				 errmsg("could not read process stat file \"%s\": %m", path)));
+		return -1;
+	}
+
+	{
+		/* Find the last ')', which marks the end of the process name */
+		p = strrchr(line, ')');
+		if (p == NULL) {
+			ereport(DEBUG1,
+					(errmsg("Failed to find ')' in stat line for pid %d", pid)));
+			return -1;
+		}
+
+		/*
+		 * Skip to the first field after the process name.
+		 *
+		 * strrchr() only guarantees ')' is somewhere inside line[]; it may sit
+		 * on the last byte before the terminator (a truncated or malformed
+		 * line).  Blindly advancing two bytes would then read past the end of
+		 * the buffer.  Checking p[1] first is sufficient: if it is not the
+		 * terminator then line[] holds at least one more byte after it, so
+		 * p += 2 stays inside the NUL-terminated string.
+		 */
+		if (p[1] == '\0') {
+			ereport(DEBUG1,
+					(errmsg("Unexpected end of stat line for pid %d", pid)));
+			return -1;
+		}
+
+		p += 2;  /* skip ') ' */
+		if (*p == '\0') {
+			ereport(DEBUG1,
+					(errmsg("Unexpected end of stat line for pid %d", pid)));
+			return -1;
+		}
+
+		/* Skip 11 fields to reach utime */
+		for (i = 0; i < 11; i++) {
+			p = strchr(p, ' ');
+			if (p == NULL) {
+				ereport(DEBUG1,
+						(errmsg("Failed to find field %d in stat line for pid %d", i+1, pid)));
+				return -1;
+			}
+			p++;  /* skip space */
+			if (*p == '\0') {
+				ereport(DEBUG1,
+						(errmsg("Unexpected end of stat line at field %d for pid %d", i+1, pid)));
+				return -1;
+			}
+		}
+
+		/*
+		 * Read utime and stime only.  cutime/cstime account for reaped child
+		 * processes, which a PostgreSQL backend never has, so including them
+		 * can only skew the value.
+		 */
+		utime = atol(p);
+
+		p = strchr(p, ' ');
+		if (p != NULL)
+			stime = atol(p + 1);
+
+		ereport(DEBUG1,
+				(errmsg("Raw CPU times for pid %d: utime=%lu, stime=%lu",
+						pid, utime, stime)));
+	}
+
+
+	/* Convert jiffies to microseconds */
+	if (utime == 0 && stime == 0) {
+		ereport(DEBUG1,
+				(errmsg("All CPU times are zero for pid %d", pid)));
+		return 0;
+	}
+
+	/*
+	 * Multiply before dividing.  (1000000 / clk_tck) truncates whenever
+	 * clk_tck does not divide 1000000 -- at clk_tck 1024 it yields 976 instead
+	 * of 976.5625, a 0.06% undercount that grows with the counter.  Linux
+	 * fixes USER_HZ at 100 for the /proc interface so this is latent rather
+	 * than active, but the correct order costs nothing.
+	 *
+	 * No overflow risk: utime + stime is in jiffies since backend start, so a
+	 * backend running for a decade at 100Hz reaches about 3e10, and 3e10 * 1e6
+	 * is 3e16 against an int64 ceiling of 9.2e18.
+	 */
+	total = (int64) (utime + stime) * 1000000 / clk_tck;
+
+	ereport(DEBUG1,
+			(errmsg("Final CPU usage for pid %d: total=" INT64_FORMAT " microseconds (CLK_TCK=%ld)",
+					pid, total, clk_tck)));
+
+	return total;
+}
+
+/*
+ * Get memory usage for a process.
+ *
+ * Reports both the resident set size and the private (non-shared) part of it.
+ * A backend's RSS is dominated by the shared_buffers pages it has touched, so
+ * RSS alone says little about what the session itself consumes and cannot be
+ * summed across sessions without counting shared memory many times over.
+ * /proc/<pid>/statm carries the resident and shared page counts on the same
+ * line, so the private figure costs no extra I/O.
+ *
+ * With huge_pages on, hugetlb pages are not counted in statm at all, so
+ * shared_buffers is already absent from resident and private ends up close to
+ * resident.  Neither figure is wrong, but the relationship between the two
+ * columns depends on that setting -- worth knowing before comparing hosts.
+ *
+ * Both outputs are set to -1 when the values cannot be determined; the caller
+ * reports NULL for -1 and passes a successful 0 through unchanged.  See the
+ * emission site in pg_active_session_history_internal() for why the two are
+ * kept apart.
+ */
+static void get_process_memory_usage(int pid, int64 *rss_bytes,
+									 int64 *private_bytes)
+{
+	char path[256];
+	char line[1024];
+	char *p;
+	unsigned long vm_size = 0, rss = 0, shared = 0;
+	long pagesize;
+
+	*rss_bytes = -1;
+	*private_bytes = -1;
+
+	if (pid <= 0) {
+		ereport(DEBUG1,
+				(errmsg("Invalid pid: %d", pid)));
+		return;
+	}
+
+	pagesize = sysconf(_SC_PAGESIZE);
+	if (pagesize <= 0) {
+		ereport(DEBUG1,
+				(errmsg("Failed to get _SC_PAGESIZE, using default value 4096")));
+		pagesize = 4096;
+	}
+
+	snprintf(path, sizeof(path), "/proc/%d/statm", pid);
+	if (!read_proc_file(path, line, sizeof(line))) {
+		ereport(DEBUG1,
+				(errcode_for_file_access(),
+				 errmsg("could not read process statm file \"%s\": %m", path)));
+		return;
+	}
+
+	{
+		/* Fields are: size resident shared text lib data dt */
+		p = line;
+
+		/* Skip leading whitespace */
+		while (*p == ' ' || *p == '\t') p++;
+		if (*p == '\0') {
+			ereport(DEBUG1,
+					(errmsg("Empty statm line for pid %d", pid)));
+			return;
+		}
+
+		/* Read only so the DEBUG1 line below can report it; not returned. */
+		vm_size = atol(p);
+
+		/* Find start of second field (resident) */
+		p = strchr(p, ' ');
+		if (p == NULL) {
+			ereport(DEBUG1,
+					(errmsg("Failed to find RSS field in statm line for pid %d", pid)));
+			return;
+		}
+
+		/* Skip whitespace */
+		p++;
+		while (*p == ' ' || *p == '\t') p++;
+		if (*p == '\0') {
+			ereport(DEBUG1,
+					(errmsg("Unexpected end of statm line for pid %d", pid)));
+			return;
+		}
+
+		rss = atol(p);
+
+		/* Find start of third field (shared) */
+		p = strchr(p, ' ');
+		if (p != NULL) {
+			p++;
+			while (*p == ' ' || *p == '\t') p++;
+			if (*p != '\0')
+				shared = atol(p);
+		}
+
+		ereport(DEBUG1,
+				(errmsg("Memory usage for pid %d: vm_size=%lu pages, rss=%lu pages, shared=%lu pages",
+						pid, vm_size, rss, shared)));
+	}
+
+
+	/*
+	 * Reject page counts that would overflow when scaled to bytes.  A garbled
+	 * or truncated statm line would otherwise wrap around and store a value
+	 * that looks like a real measurement.
+	 */
+	if (rss > (unsigned long) (PG_INT64_MAX / pagesize)) {
+		ereport(DEBUG1,
+				(errmsg("Implausible RSS page count %lu for pid %d, discarding",
+						rss, pid)));
+		return;
+	}
+
+	/* shared can exceed resident only on a torn read; clamp instead of wrapping */
+	if (shared > rss)
+		shared = rss;
+
+	*rss_bytes = (int64) rss * pagesize;
+	*private_bytes = (int64) (rss - shared) * pagesize;
+
+	ereport(DEBUG1,
+			(errmsg("Physical memory for pid %d: rss=" INT64_FORMAT " bytes, private=" INT64_FORMAT " bytes",
+					pid, *rss_bytes, *private_bytes)));
+}
+
+#else							/* !__linux__ */
+
+/*
+ * Non-Linux stubs.  /proc is unavailable, so the values cannot be determined
+ * and -1 is returned, which the reader renders as NULL -- exactly as it would
+ * for a read that failed at runtime.
+ */
+static int64
+get_process_cpu_usage(int pid)
+{
+	(void) pid;
+	return -1;
+}
+
+static void
+get_process_memory_usage(int pid, int64 *rss_bytes,
+						 int64 *private_bytes)
+{
+	(void) pid;
+	*rss_bytes = -1;
+	*private_bytes = -1;
+}
+
+#endif							/* __linux__ */
